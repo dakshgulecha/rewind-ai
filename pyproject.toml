@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rewind-ai"
+version = "1.0.0"
+description = "Automatic session checkpoints for AI coding agents. Undo just what went wrong."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "rewind contributors" }]
+requires-python = ">=3.10"
+keywords = ["ai", "claude", "cursor", "copilot", "git", "undo", "checkpoint", "agent"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Software Development :: Version Control",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "watchdog>=4.0.0",
+    "gitpython>=3.1.40",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "platformdirs>=4.0.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov", "black", "ruff", "mypy"]
+
+[project.scripts]
+rewind = "rewind.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/rewind-ai/rewind"
+Issues = "https://github.com/rewind-ai/rewind/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rewind*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+strict = true
