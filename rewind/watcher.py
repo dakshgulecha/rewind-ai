@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import atexit
 import os
-import queue
 import signal
 import subprocess
 import threading
@@ -11,8 +10,10 @@ from threading import Event, Timer
 
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 from watchdog.observers import Observer
+from rich.console import Console
 
 from rewind.checkpoint import CheckpointStore
+from rewind.config import RewindConfig, load_config
 
 HIGH_VALUE_FILES = {
     "package.json",
@@ -76,10 +77,16 @@ def _is_ignored(path: str) -> bool:
 class BurstDetector(FileSystemEventHandler):
     BURST_WINDOW = 3.0
 
-    def __init__(self, store: CheckpointStore, quiet: bool = False):
+    def __init__(
+        self, store: CheckpointStore, quiet: bool = False,
+        burst_window: float = BURST_WINDOW, ignored_paths: set[str] | None = None,
+    ):
         super().__init__()
         self.store = store
         self.quiet = quiet
+        self.burst_window = burst_window
+        self.ignored_paths = {path.strip("/") for path in (ignored_paths or set())}
+        self.suspended = Event()
         self._pending_files: set[str] = set()
         self._timer: Timer | None = None
         self._lock = threading.Lock()
@@ -88,7 +95,7 @@ class BurstDetector(FileSystemEventHandler):
         with self._lock:
             if self._timer is not None:
                 self._timer.cancel()
-            self._timer = Timer(self.BURST_WINDOW, self._flush)
+            self._timer = Timer(self.burst_window, self._flush)
             self._timer.daemon = True
             self._timer.start()
 
@@ -127,7 +134,11 @@ class BurstDetector(FileSystemEventHandler):
             )
 
     def _record_event(self, path: str, high_value: bool = False) -> None:
-        if _is_ignored(path):
+        normalized = path.replace("\\", "/")
+        if self.suspended.is_set() or _is_ignored(path) or any(
+            normalized.endswith(f"/{ignored}") or f"/{ignored}/" in normalized
+            for ignored in self.ignored_paths
+        ):
             return
         with self._lock:
             self._pending_files.add(path)
@@ -169,11 +180,18 @@ class GuardedBurstDetector(BurstDetector):
     Auto-rolls back to the last known-good checkpoint if the test fails.
     """
 
-    def __init__(self, store: CheckpointStore, test_cmd: str, quiet: bool = False):
-        super().__init__(store, quiet)
+    def __init__(
+        self, store: CheckpointStore, test_cmd: str, quiet: bool = False,
+        burst_window: float = BurstDetector.BURST_WINDOW,
+        ignored_paths: set[str] | None = None, timeout: float = 120.0,
+    ):
+        super().__init__(store, quiet, burst_window, ignored_paths)
         self.test_cmd = test_cmd
         self._last_good_index: int = -1
-        self._guard_queue: queue.Queue = queue.Queue()
+        self.timeout = timeout
+        self._baseline_ready = False
+        self._pending_checkpoint = None
+        self._guard_event = Event()
         self._guard_thread = threading.Thread(target=self._guard_worker, daemon=True)
         self._guard_thread.start()
 
@@ -195,39 +213,74 @@ class GuardedBurstDetector(BurstDetector):
                 f"[dim cyan]rewind[/dim cyan] checkpoint #{cp.index} "
                 f"[dim]— {cp.change_summary}[/dim] — running guard..."
             )
-        self._guard_queue.put(cp)
+        self._pending_checkpoint = cp
+        self._guard_event.set()
+
+    def establish_baseline(self, checkpoint) -> None:
+        """A guard never rolls back until the starting state has passed."""
+        if self._run_guard(checkpoint):
+            self._last_good_index = checkpoint.index
+            self._baseline_ready = True
+            if not self.quiet:
+                Console(stderr=True).print("[green]✓ Guard baseline passed[/green]")
+        else:
+            Console(stderr=True).print(
+                "[bold yellow]⚠ Guard baseline failed; automatic rollback is disabled "
+                "until the starting state passes.[/bold yellow]"
+            )
+
+    def _run_guard(self, cp) -> bool:
+        try:
+            result = subprocess.run(
+                self.test_cmd, shell=True, capture_output=self.quiet, text=True,
+                timeout=self.timeout,
+            )
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            Console(stderr=True).print(
+                f"[bold red]✗ Guard timed out after {self.timeout:g}s[/bold red]"
+            )
+            return False
 
     def _guard_worker(self) -> None:
         from rich.console import Console
         cons = Console(stderr=True)
         while True:
-            cp = self._guard_queue.get()
-            if cp is None:
+            self._guard_event.wait()
+            if self._pending_checkpoint is None:
                 break
-            result = subprocess.run(
-                self.test_cmd, shell=True,
-                capture_output=self.quiet,
-                text=True,
-            )
-            if result.returncode == 0:
+            cp = self._pending_checkpoint
+            self._pending_checkpoint = None
+            self._guard_event.clear()
+            passed = self._run_guard(cp)
+
+            # A new burst arrived while tests ran: discard this stale result and
+            # immediately test the newest checkpoint instead.
+            if self._guard_event.is_set():
+                continue
+
+            if passed:
                 self._last_good_index = cp.index
+                self._baseline_ready = True
                 if not self.quiet:
                     cons.print(f"[green]✓ Guard passed[/green] after checkpoint #{cp.index}")
-            else:
-                rollback_to = (
-                    self._last_good_index
-                    if self._last_good_index >= 0
-                    else max(0, cp.index - 1)
-                )
+            elif self._baseline_ready and self._last_good_index >= 0:
+                rollback_to = self._last_good_index
                 cons.print(
                     f"[bold red]✗ Guard failed![/bold red] "
                     f"Rolling back to checkpoint #{rollback_to}..."
                 )
-                self.store.restore(rollback_to)
-            self._guard_queue.task_done()
+                self.suspended.set()
+                try:
+                    self.store.restore(rollback_to)
+                finally:
+                    self.suspended.clear()
+            else:
+                cons.print("[yellow]Guard failed; no known-good baseline to restore.[/yellow]")
 
     def stop(self) -> None:
-        self._guard_queue.put(None)
+        self._pending_checkpoint = None
+        self._guard_event.set()
         self._guard_thread.join(timeout=5)
 
 
@@ -236,6 +289,7 @@ class Watcher:
         self.repo_path = repo_path
         self.quiet = quiet
         self.interval = interval
+        self.config: RewindConfig = load_config(repo_path)
         self._store = CheckpointStore(repo_path)
         self._pid_file = Path(self._store.git_dir) / "rewind.pid"
 
@@ -247,7 +301,11 @@ class Watcher:
             self._pid_file.unlink()
 
     def _make_detector(self) -> BurstDetector:
-        return BurstDetector(self._store, quiet=self.quiet)
+        return BurstDetector(
+            self._store, quiet=self.quiet,
+            burst_window=self.config.burst_window_seconds,
+            ignored_paths=self.config.ignore,
+        )
 
     def start(self) -> None:
         from rich.console import Console
@@ -257,12 +315,16 @@ class Watcher:
         atexit.register(self._clear_pid)
 
         # Prune stale checkpoints on session start
-        pruned = self._store.prune()
+        pruned = self._store.prune(
+            max_age_days=self.config.max_age_days, max_count=self.config.max_count
+        )
         if pruned and not self.quiet:
             cons.print(f"[dim cyan]rewind[/dim cyan] pruned {pruned} old checkpoint(s)")
 
-        # Initial snapshot: captures any uncommitted changes before agent starts
-        initial_cp = self._store.create(trigger="initial", label="Session start")
+        # Always mark the beginning of a watch session, including clean trees.
+        initial_cp = self._store.create(
+            trigger="initial", label="Initial Snap", force=True
+        )
         if initial_cp and not self.quiet:
             cons.print(
                 f"[dim cyan]rewind[/dim cyan] initial snapshot #{initial_cp.index} "
@@ -270,6 +332,8 @@ class Watcher:
             )
 
         handler = self._make_detector()
+        if isinstance(handler, GuardedBurstDetector) and initial_cp:
+            handler.establish_baseline(initial_cp)
         observer = Observer(timeout=self.interval)
         observer.schedule(handler, str(self.repo_path), recursive=True)
         observer.start()
@@ -334,4 +398,9 @@ class GuardedWatcher(Watcher):
         self.test_cmd = test_cmd
 
     def _make_detector(self) -> BurstDetector:
-        return GuardedBurstDetector(self._store, self.test_cmd, quiet=self.quiet)
+        return GuardedBurstDetector(
+            self._store, self.test_cmd, quiet=self.quiet,
+            burst_window=self.config.burst_window_seconds,
+            ignored_paths=self.config.ignore,
+            timeout=self.config.guard_timeout_seconds,
+        )

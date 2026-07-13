@@ -4,7 +4,7 @@
 
 ### An undo button for AI coding agents.
 
-Rewind watches your repository, automatically creates checkpoints whenever an AI agent starts making changes, and lets you instantly roll back to any point in the session. No commits, no branch switching, no lost work—just one command to get back to the last good state.
+Rewind watches your repository, creates lightweight checkpoints while an AI agent works, and lets you roll back to any point in the session. No commits, no branch switching, no lost work—just one command to get back to the last good state.
 
 [![PyPI version](https://img.shields.io/pypi/v/rewind-ai.svg)](https://pypi.org/project/rewind-ai/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
@@ -110,7 +110,7 @@ Session checkpoints  (5 total)
 3  4m ago    Modified auth, Added utils          ~2 +1 added      main
 2  8m ago    Added auth module                   +3 added         main
 1  12m ago   Modified package.json               ~1 modified      main
-0  14m ago   Session start                       +1 added         main
+0  14m ago   Initial Snap                        no changes       main
 ```
 
 Something broke after checkpoint 2.
@@ -223,7 +223,20 @@ Start the watcher:
 rewind watch &
 ```
 
-That's it.
+Every watch session starts with an **Initial Snap**, even when the tree is clean. Create an additional marker whenever you want:
+
+```bash
+rewind snap                         # works even with no file changes
+rewind snap -m "before migration"
+```
+
+That's it for the default workflow. For repository-local tuning, run:
+
+```bash
+rewind init
+```
+
+This creates `.rewind.toml` and adds it to `.gitignore`, so personal guard commands and watcher preferences stay local.
 
 Rewind now silently watches your repository and automatically creates checkpoints whenever an AI agent starts making significant changes.
 
@@ -239,7 +252,7 @@ No cloud account.
 
 Rewind monitors filesystem activity and detects write bursts—the characteristic pattern of AI coding agents modifying multiple files in rapid succession.
 
-When a burst is detected, Rewind creates a lightweight checkpoint of your working tree.
+When a burst is detected, Rewind creates a lightweight checkpoint of your working tree. Snapshot creation uses a temporary Git index, so it does not alter anything you already staged.
 
 These checkpoints:
 
@@ -248,7 +261,7 @@ These checkpoints:
 - Don't touch your branch
 - Don't require any action from you
 
-They're simply there when you need them.
+They're simply there when you need them. Rewind serializes checkpoint updates, so the watcher and manual commands cannot overwrite each other's metadata.
 
 **Under the hood:** each checkpoint is a shadow git commit stored under `refs/rewind/TIMESTAMP`—invisible to `git log`, `git status`, and `git push`. Checkpoints are deduplicated by tree hash, so identical states are never stored twice. A typical session of 50 checkpoints uses 2–5 MB.
 
@@ -282,6 +295,49 @@ When Rewind detects a write burst that touches `CLAUDE.md`, `AGENTS.md`, `.curso
    AI agents modifying their own instruction files is a known risk.
    Checkpoint #7 captured this change.
    Run rewind diff 7 to review.
+```
+
+---
+
+## Sessions, Tags, and Local Configuration
+
+Use a named session to mark a focused piece of work, and tags to make a known-good point easy to find later:
+
+```bash
+rewind session start "authentication"
+rewind tag 4 known-good
+rewind session end
+```
+
+Sessions are durable checkpoint markers; tags appear beside a checkpoint in `rewind list`.
+
+`rewind init` creates this optional local configuration file:
+
+```toml
+[watch]
+burst_window_seconds = 3
+ignore = ["coverage/", "generated/"]
+
+[guard]
+command = "pytest"
+timeout_seconds = 120
+
+[retention]
+max_count = 200
+max_age_days = 7
+```
+
+Run `rewind guard` with no argument to use `guard.command` from the file. `.rewind.toml` is intentionally ignored by Git.
+
+---
+
+## Guard Mode That Respects Your Baseline
+
+Guard mode first tests the Initial Snap. Automatic rollback is enabled only after that starting state passes. If edits arrive while a test is running, Rewind discards the stale result and tests the newest checkpoint instead. Test commands also honor the configured timeout.
+
+```bash
+rewind guard "pytest tests/"
+rewind guard                 # uses guard.command from .rewind.toml
 ```
 
 ---
@@ -354,6 +410,29 @@ rewind checkout 2 src/auth.py    # restore this file from a specific checkpoint
 rewind branch 4
 ```
 
+### Organize a Session
+
+```bash
+rewind session start "auth refactor"
+rewind session status
+rewind tag 4 known-good
+rewind session end
+```
+
+### Set Up and Diagnose Rewind
+
+```bash
+rewind init                  # local config + .gitignore entry
+rewind doctor                # check Git, config, metadata, watcher, and hooks
+rewind repair                # rebuild metadata from refs/rewind/*
+rewind context               # show the latest rollback context
+rewind install               # append a managed post-checkout hook block
+rewind uninstall             # remove only Rewind's hook block
+rewind completion zsh        # print a shell-completion script
+```
+
+`rewind install` preserves an existing `post-checkout` hook and only starts Rewind after checkout events. It does not start a watcher merely because you open a directory.
+
 ### Remove Checkpoints
 
 ```bash
@@ -391,6 +470,10 @@ Everything runs locally.
 - No network requests
 
 Your code never leaves your machine.
+
+## Scope and Safety Notes
+
+Rewind snapshots Git-tracked files and normal untracked files. Git-ignored files are not captured, so generated output, dependency folders, and secrets covered by `.gitignore` are left alone. Checkpoints are local Git refs, not a backup service—keep using your normal remote and backup practices.
 
 ---
 

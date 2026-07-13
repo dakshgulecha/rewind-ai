@@ -4,7 +4,9 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
@@ -15,6 +17,7 @@ from rich.console import Console
 console = Console()
 
 REWIND_REF_PREFIX = "refs/rewind/"
+REWIND_TAG_REF_PREFIX = "refs/rewind-tags/"
 EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 MAX_CHECKPOINTS = 200
 
@@ -32,6 +35,8 @@ class Checkpoint:
     trigger: str
     agent_hint: str = ""
     branch: str = ""
+    session: str = ""
+    tags: list[str] | None = None
 
     @property
     def age_str(self) -> str:
@@ -72,6 +77,8 @@ class Checkpoint:
             trigger=d["trigger"],
             agent_hint=d.get("agent_hint", ""),
             branch=d.get("branch", ""),
+            session=d.get("session", ""),
+            tags=d.get("tags", []),
         )
 
 
@@ -84,7 +91,9 @@ class CheckpointStore:
             raise ValueError(f"{repo_path} is not inside a git repository")
         self.git_dir = Path(self.repo.git_dir)
         self.meta_path = self.git_dir / "rewind_meta.json"
+        self.lock_path = self.git_dir / "rewind.lock"
         self._checkpoints: list[Checkpoint] = []
+        self.active_session = ""
         self._load_meta()
 
     # ── I/O ──────────────────────────────────────────────────────────────────
@@ -94,6 +103,7 @@ class CheckpointStore:
             try:
                 data = json.loads(self.meta_path.read_text())
                 self._checkpoints = [Checkpoint.from_dict(c) for c in data.get("checkpoints", [])]
+                self.active_session = data.get("active_session", "")
                 return
             except Exception:
                 pass
@@ -102,10 +112,38 @@ class CheckpointStore:
 
     def _save_meta(self) -> None:
         """Atomic write to prevent corruption from concurrent processes."""
-        data = {"checkpoints": [c.to_dict() for c in self._checkpoints]}
+        data = {
+            "checkpoints": [c.to_dict() for c in self._checkpoints],
+            "active_session": self.active_session,
+        }
         tmp = self.meta_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2))
         tmp.replace(self.meta_path)  # atomic on POSIX
+
+    @contextmanager
+    def _exclusive_lock(self):
+        """Serialize metadata/ref changes across watcher and CLI processes."""
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, f"{os.getpid()} {time.time()}\n".encode())
+                os.close(fd)
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - self.lock_path.stat().st_mtime > 120:
+                        self.lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("timed out waiting for another rewind operation")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            self.lock_path.unlink(missing_ok=True)
 
     def _rebuild_from_refs(self) -> None:
         """Reconstruct checkpoint metadata from git refs after JSON loss."""
@@ -141,6 +179,7 @@ class CheckpointStore:
                 agent_hint = _val("agent")
                 trigger = _val("trigger", "burst")
                 branch = _val("branch")
+                session = _val("session")
                 tree_sha = self._git("log", "-1", "--format=%T", commit_sha)
 
                 prev_tree = (
@@ -162,24 +201,48 @@ class CheckpointStore:
                     trigger=trigger,
                     agent_hint=agent_hint,
                     branch=branch,
+                    session=session,
+                    tags=[],
                 )
                 checkpoints.append(cp)
             except (RuntimeError, ValueError):
                 continue
 
         if checkpoints:
+            try:
+                tag_refs = self._git(
+                    "for-each-ref", "--format=%(refname) %(objectname)",
+                    REWIND_TAG_REF_PREFIX,
+                )
+                tags_by_sha: dict[str, list[str]] = {}
+                for line in tag_refs.splitlines():
+                    ref, sha = line.split(maxsplit=1)
+                    tag = ref.removeprefix(REWIND_TAG_REF_PREFIX)
+                    tags_by_sha.setdefault(sha, []).append(tag)
+                for cp in checkpoints:
+                    cp.tags = tags_by_sha.get(cp.sha, [])
+            except (RuntimeError, ValueError):
+                pass
             self._checkpoints = checkpoints
+            self.active_session = ""
+            for cp in checkpoints:
+                if cp.trigger == "session-start":
+                    self.active_session = cp.session
+                elif cp.trigger == "session-end":
+                    self.active_session = ""
             self._save_meta()
 
     # ── Git helpers ───────────────────────────────────────────────────────────
 
-    def _git(self, *args: str) -> str:
+    def _git(self, *args: str, extra_env: Optional[dict[str, str]] = None) -> str:
         """Run a git command with exponential backoff on index.lock contention."""
         env = os.environ.copy()
         env.setdefault("GIT_AUTHOR_NAME", "rewind")
         env.setdefault("GIT_AUTHOR_EMAIL", "rewind@local")
         env.setdefault("GIT_COMMITTER_NAME", "rewind")
         env.setdefault("GIT_COMMITTER_EMAIL", "rewind@local")
+        if extra_env:
+            env.update(extra_env)
         delays = [0.05, 0.10, 0.25]
         for attempt, delay in enumerate(delays + [None]):
             result = subprocess.run(
@@ -194,13 +257,6 @@ class CheckpointStore:
                 continue
             raise RuntimeError(err)
         raise RuntimeError("git command failed after retries")
-
-    def _git_unstage(self) -> None:
-        """Unstage everything. Works on both empty repos and normal repos."""
-        try:
-            self._git("reset")
-        except RuntimeError:
-            pass  # nothing staged, harmless
 
     def _head_tree(self) -> str:
         """Return current HEAD's tree SHA, or the empty tree SHA if no commits."""
@@ -322,15 +378,32 @@ class CheckpointStore:
     def checkpoints(self) -> list[Checkpoint]:
         return list(self._checkpoints)
 
-    def create(self, trigger: str = "auto", label: str = "") -> Optional[Checkpoint]:
-        """Snapshot the working tree. Returns None if nothing changed."""
+    def create(
+        self, trigger: str = "auto", label: str = "", force: bool = False
+    ) -> Optional[Checkpoint]:
+        with self._exclusive_lock():
+            self._load_meta()
+            return self._create(trigger=trigger, label=label, force=force)
+
+    def _create(
+        self, trigger: str = "auto", label: str = "", force: bool = False
+    ) -> Optional[Checkpoint]:
+        """Snapshot the working tree.
+
+        By default identical trees are skipped. ``force=True`` is for explicit
+        user/session markers, which should be recorded even when no files differ.
+        A temporary index is used so a checkpoint never alters staged changes.
+        """
+        index_fd, index_path = tempfile.mkstemp(prefix="rewind-index-", dir=self.git_dir)
+        os.close(index_fd)
+        Path(index_path).unlink(missing_ok=True)
+        index_env = {"GIT_INDEX_FILE": index_path}
         try:
-            self._git("add", "-A")
-            tree_sha = self._git("write-tree")
+            self._git("add", "-A", extra_env=index_env)
+            tree_sha = self._git("write-tree", extra_env=index_env)
 
             # Dedup: skip if tree is identical to the last checkpoint
-            if self._checkpoints and self._checkpoints[-1].tree_sha == tree_sha:
-                self._git_unstage()
+            if not force and self._checkpoints and self._checkpoints[-1].tree_sha == tree_sha:
                 return None
 
             # Determine the baseline tree for change detection
@@ -343,8 +416,7 @@ class CheckpointStore:
             # Use tree-to-tree diff: catches shadow-only changes that
             # git diff --cached misses (e.g. deleting an untracked file)
             modified, added, deleted = self._tree_diff_stats(prev_tree, tree_sha)
-            if not (modified or added or deleted):
-                self._git_unstage()
+            if not force and not (modified or added or deleted):
                 return None
 
             timestamp = time.time()
@@ -372,16 +444,18 @@ class CheckpointStore:
                 f"timestamp={timestamp}\n"
                 f"agent={agent}\n"
                 f"trigger={trigger}\n"
-                f"branch={current_branch}",
+                f"branch={current_branch}\n"
+                f"session={self.active_session}",
             )
 
             self._git("update-ref", ref_name, commit_sha)
-            self._git_unstage()
 
         except RuntimeError as e:
-            self._git_unstage()
             console.print(f"[red]rewind: checkpoint failed: {e}[/red]")
             return None
+        finally:
+            Path(index_path).unlink(missing_ok=True)
+            Path(f"{index_path}.lock").unlink(missing_ok=True)
 
         cp = Checkpoint(
             index=len(self._checkpoints),
@@ -395,10 +469,70 @@ class CheckpointStore:
             trigger=trigger,
             agent_hint=agent,
             branch=current_branch,
+            session=self.active_session,
+            tags=[],
         )
         self._checkpoints.append(cp)
         self._save_meta()
         return cp
+
+    def start_session(self, name: str) -> Checkpoint:
+        """Start a named session and persist a marker checkpoint."""
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("session name cannot be empty")
+        with self._exclusive_lock():
+            self._load_meta()
+            self.active_session = clean_name
+            cp = self._create(
+                trigger="session-start", label=f"Session start: {clean_name}", force=True
+            )
+            assert cp is not None
+            return cp
+
+    def end_session(self) -> Optional[Checkpoint]:
+        """End the active session with a durable marker."""
+        with self._exclusive_lock():
+            self._load_meta()
+            if not self.active_session:
+                return None
+            name = self.active_session
+            cp = self._create(
+                trigger="session-end", label=f"Session end: {name}", force=True
+            )
+            self.active_session = ""
+            self._save_meta()
+            return cp
+
+    def add_tag(self, index: int, tag: str) -> bool:
+        clean_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", tag.strip()).strip(".-")
+        if not clean_tag:
+            return False
+        with self._exclusive_lock():
+            self._load_meta()
+            if not 0 <= index < len(self._checkpoints):
+                return False
+            cp = self._checkpoints[index]
+            if cp.tags is None:
+                cp.tags = []
+            if clean_tag not in cp.tags:
+                try:
+                    self._git("update-ref", f"{REWIND_TAG_REF_PREFIX}{clean_tag}", cp.sha)
+                except RuntimeError:
+                    return False
+                cp.tags.append(clean_tag)
+                self._save_meta()
+            return True
+
+    def repair(self) -> int:
+        """Rebuild metadata from shadow refs after a partial/corrupt write."""
+        with self._exclusive_lock():
+            self._checkpoints = []
+            self.active_session = ""
+            self._rebuild_from_refs()
+            if not self._checkpoints:
+                self._save_meta()
+            return len(self._checkpoints)
 
     def restore(self, index: int, branch: bool = False) -> bool:
         """Restore working tree to checkpoint N. Saves a pre-restore backup first."""
@@ -455,8 +589,8 @@ class CheckpointStore:
                 except OSError:
                     pass
 
-            # Restore all files from the checkpoint tree
-            self._git("checkout", cp.sha, "--", ".")
+            # Restore files without changing the user's staging area.
+            self._git("restore", "--source", cp.sha, "--worktree", "--", ".")
 
             # Write agent self-correction context
             self._write_rollback_json(cp, safety_cp)
@@ -486,25 +620,39 @@ class CheckpointStore:
         if index < 0 or index >= len(self._checkpoints):
             console.print(f"[red]No checkpoint #{index}[/red]")
             return False
+
+        work_dir = Path(self.repo.working_dir).resolve()
+        candidate = Path(file_path)
+        if candidate.is_absolute():
+            console.print("[red]File path must be relative to the repository.[/red]")
+            return False
+        try:
+            target_path = (work_dir / candidate).resolve()
+            repo_file_path = str(target_path.relative_to(work_dir))
+        except ValueError:
+            console.print("[red]File path must stay within the repository.[/red]")
+            return False
+
         cp = self._checkpoints[index]
         try:
-            ls = self._git("ls-tree", "-r", cp.sha, "--", file_path)
+            ls = self._git("ls-tree", "-r", cp.sha, "--", repo_file_path)
             if ls.strip():
-                self._git("checkout", cp.sha, "--", file_path)
+                self._git(
+                    "restore", "--source", cp.sha, "--worktree", "--", repo_file_path
+                )
                 console.print(
-                    f"[green]Restored [bold]{file_path}[/bold] "
+                    f"[green]Restored [bold]{repo_file_path}[/bold] "
                     f"from checkpoint #{index}[/green]"
                 )
             else:
-                fpath = Path(self.repo.working_dir) / file_path
-                fpath.unlink(missing_ok=True)
+                target_path.unlink(missing_ok=True)
                 console.print(
-                    f"[green]Deleted [bold]{file_path}[/bold] "
+                    f"[green]Deleted [bold]{repo_file_path}[/bold] "
                     f"(it did not exist at checkpoint #{index})[/green]"
                 )
             return True
         except RuntimeError as e:
-            console.print(f"[red]Failed to restore {file_path}: {e}[/red]")
+            console.print(f"[red]Failed to restore {repo_file_path}: {e}[/red]")
             return False
 
     def find_undo_checkpoint_for_file(self, file_path: str) -> Optional[int]:
@@ -588,6 +736,11 @@ class CheckpointStore:
             return ""
 
     def prune(self, max_age_days: float = 7.0, max_count: int = MAX_CHECKPOINTS) -> int:
+        with self._exclusive_lock():
+            self._load_meta()
+            return self._prune(max_age_days, max_count)
+
+    def _prune(self, max_age_days: float, max_count: int) -> int:
         """
         Remove checkpoints that are older than max_age_days or exceed max_count.
         Returns the number of checkpoints removed.
@@ -615,6 +768,15 @@ class CheckpointStore:
                     self._git("update-ref", "-d", ref)
             except RuntimeError:
                 pass
+            try:
+                tag_refs = self._git(
+                    "for-each-ref", "--format=%(refname)", f"--points-at={cp.sha}",
+                    REWIND_TAG_REF_PREFIX,
+                ).splitlines()
+                for ref in tag_refs:
+                    self._git("update-ref", "-d", ref)
+            except RuntimeError:
+                pass
 
         self._checkpoints = kept
         for i, cp in enumerate(self._checkpoints):
@@ -623,15 +785,26 @@ class CheckpointStore:
         return len(to_remove)
 
     def clear_session(self) -> None:
+        with self._exclusive_lock():
+            self._load_meta()
+            self._clear_session()
+
+    def _clear_session(self) -> None:
         try:
             refs = self._git(
                 "for-each-ref", "--format=%(refname)", REWIND_REF_PREFIX
             ).splitlines()
             for ref in refs:
                 self._git("update-ref", "-d", ref)
+            tag_refs = self._git(
+                "for-each-ref", "--format=%(refname)", REWIND_TAG_REF_PREFIX
+            ).splitlines()
+            for ref in tag_refs:
+                self._git("update-ref", "-d", ref)
         except RuntimeError:
             pass
         self._checkpoints = []
+        self.active_session = ""
         if self.meta_path.exists():
             self.meta_path.unlink()
         rollback = self.git_dir / "rewind_latest_rollback.json"

@@ -10,3 +10,6 @@ build/
 .ruff_cache/
 
 .DS_Store
+
+# Rewind local configuration
+.rewind.toml

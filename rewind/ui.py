@@ -40,7 +40,9 @@ def render_checkpoint_list(checkpoints: list[Checkpoint], current_sha: str = "")
             style="bold green" if is_current else ("dim" if is_pre_restore else ""),
         )
         label_style = "dim italic" if is_pre_restore else ("dim" if is_initial else "")
-        label_cell = Text(cp.label, style="bold" if is_current else label_style)
+        tags = f"  [{', '.join(cp.tags or [])}]" if cp.tags else ""
+        session = f"  ({cp.session})" if cp.session else ""
+        label_cell = Text(f"{cp.label}{tags}{session}", style="bold" if is_current else label_style)
 
         changes: list[Text] = []
         if cp.files_changed:
@@ -58,6 +60,8 @@ def render_checkpoint_list(checkpoints: list[Checkpoint], current_sha: str = "")
             "initial": "dim",
             "pre-restore": "dim italic",
             "guard": "magenta dim",
+            "session-start": "bold green",
+            "session-end": "dim green",
         }.get(cp.trigger, "dim")
 
         branch_text = (cp.branch[:12] if cp.branch else "—")

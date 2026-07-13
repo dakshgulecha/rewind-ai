@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,7 @@ from rich.console import Console
 from rich.prompt import Confirm
 
 from rewind.checkpoint import CheckpointStore
+from rewind.config import CONFIG_FILE, DEFAULT_CONFIG, load_config
 from rewind.watcher import Watcher, GuardedWatcher
 
 console = Console()
@@ -66,10 +68,10 @@ def watch(quiet: bool, interval: float) -> None:
 
 
 @main.command()
-@click.argument("test_cmd")
+@click.argument("test_cmd", required=False)
 @click.option("--quiet", "-q", is_flag=True)
 @click.option("--interval", default=1.0, show_default=True)
-def guard(test_cmd: str, quiet: bool, interval: float) -> None:
+def guard(test_cmd: str | None, quiet: bool, interval: float) -> None:
     """Watch files and auto-rollback if TEST_CMD fails after a burst.
 
     \b
@@ -82,6 +84,13 @@ def guard(test_cmd: str, quiet: bool, interval: float) -> None:
     the working tree is automatically restored to the last good checkpoint.
     """
     repo_root = _find_repo_root()
+    config = load_config(repo_root)
+    test_cmd = test_cmd or config.guard_command
+    if not test_cmd:
+        console.print(
+            f"[red]Provide TEST_CMD or set guard.command in {CONFIG_FILE}.[/red]"
+        )
+        return
     store = CheckpointStore(repo_root)
     running, pid = Watcher.is_running(Path(store.git_dir))
     if running:
@@ -365,16 +374,64 @@ def branch(index: int) -> None:
 @main.command()
 @click.option("--label", "-m", default="")
 def snap(label: str) -> None:
-    """Manually create a checkpoint right now."""
+    """Manually create a checkpoint right now, even if nothing changed."""
     store = _get_store()
-    cp = store.create(trigger="manual", label=label)
+    cp = store.create(
+        trigger="manual", label=label or "Manual Snap", force=True
+    )
+
+
+@main.group()
+def session() -> None:
+    """Start, end, and inspect named checkpoint sessions."""
+
+
+@session.command(name="start")
+@click.argument("name")
+def session_start(name: str) -> None:
+    """Start a named session and write a marker checkpoint."""
+    try:
+        cp = _get_store().start_session(name)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    console.print(f"[green]Started session [bold]{name}[/bold] at checkpoint #{cp.index}.[/green]")
+
+
+@session.command(name="end")
+def session_end() -> None:
+    """End the active session with a marker checkpoint."""
+    cp = _get_store().end_session()
+    if cp is None:
+        console.print("[yellow]No active session.[/yellow]")
+    else:
+        console.print(f"[green]Ended session at checkpoint #{cp.index}.[/green]")
+
+
+@session.command(name="status")
+def session_status() -> None:
+    """Show the active session name."""
+    store = _get_store()
+    if store.active_session:
+        console.print(f"[green]Active session:[/green] [bold]{store.active_session}[/bold]")
+    else:
+        console.print("[dim]No active session.[/dim]")
+
+
+@main.command()
+@click.argument("index", type=int)
+@click.argument("name")
+def tag(index: int, name: str) -> None:
+    """Add a memorable tag NAME to checkpoint INDEX."""
+    store = _get_store()
+    if not store.add_tag(index, name):
+        console.print(f"[red]Could not tag checkpoint #{index}.[/red]")
+        return
+    console.print(f"[green]Tagged checkpoint #{index} as [bold]{name}[/bold].[/green]")
     if cp:
         console.print(
             f"[green]Checkpoint #{cp.index} created:[/green] "
             f"{cp.label}  [dim]({cp.change_summary})[/dim]"
         )
-    else:
-        console.print("[dim]Nothing changed since the last checkpoint.[/dim]")
 
 
 @main.command()
@@ -430,10 +487,12 @@ def prune(max_age: float, max_count: int, dry_run: bool) -> None:
         console.print("[dim]Nothing to prune.[/dim]")
 
 
-# ── Install ───────────────────────────────────────────────────────────────────
+# ── Setup and diagnostics ────────────────────────────────────────────────────
 
-GLOBAL_HOOK_SCRIPT = """\
-#!/bin/sh
+HOOK_START = "# >>> rewind managed hook >>>"
+HOOK_END = "# <<< rewind managed hook <<<"
+HOOK_BLOCK = f"""\
+{HOOK_START}
 if command -v rewind >/dev/null 2>&1; then
   GIT_DIR=$(git rev-parse --git-dir 2>/dev/null)
   if [ -n "$GIT_DIR" ]; then
@@ -443,7 +502,116 @@ if command -v rewind >/dev/null 2>&1; then
     fi
   fi
 fi
+{HOOK_END}
 """
+
+
+def _add_to_gitignore(repo_root: Path) -> bool:
+    path = repo_root / ".gitignore"
+    existing = path.read_text() if path.exists() else ""
+    if CONFIG_FILE in {line.strip() for line in existing.splitlines()}:
+        return False
+    suffix = "" if not existing or existing.endswith("\n") else "\n"
+    path.write_text(f"{existing}{suffix}\n# Rewind local configuration\n{CONFIG_FILE}\n")
+    return True
+
+
+def _install_hook(hook_path: Path) -> None:
+    existing = hook_path.read_text() if hook_path.exists() else "#!/bin/sh\n"
+    if HOOK_START in existing and HOOK_END in existing:
+        return
+    suffix = "" if existing.endswith("\n") else "\n"
+    hook_path.write_text(f"{existing}{suffix}{HOOK_BLOCK}")
+    hook_path.chmod(0o755)
+
+
+def _uninstall_hook(hook_path: Path) -> bool:
+    if not hook_path.exists():
+        return False
+    existing = hook_path.read_text()
+    start, end = existing.find(HOOK_START), existing.find(HOOK_END)
+    if start < 0 or end < start:
+        return False
+    hook_path.write_text((existing[:start] + existing[end + len(HOOK_END):]).strip() + "\n")
+    return True
+
+
+@main.command()
+def init() -> None:
+    """Create local configuration and keep it out of version control."""
+    repo_root = _find_repo_root()
+    config_path = repo_root / CONFIG_FILE
+    if config_path.exists():
+        console.print(f"[yellow]{CONFIG_FILE} already exists.[/yellow]")
+    else:
+        config_path.write_text(DEFAULT_CONFIG)
+        console.print(f"[green]Created [bold]{CONFIG_FILE}[/bold].[/green]")
+    if _add_to_gitignore(repo_root):
+        console.print(f"[green]Added {CONFIG_FILE} to .gitignore.[/green]")
+
+
+@main.command()
+def doctor() -> None:
+    """Check whether this repository is ready for safe Rewind operation."""
+    repo_root = _find_repo_root()
+    store = CheckpointStore(repo_root)
+    failures: list[str] = []
+    checks: list[tuple[str, str]] = []
+    git_version = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout.strip()
+    checks.append(("Git", git_version or "not found"))
+    if not git_version:
+        failures.append("Git is unavailable")
+    try:
+        load_config(repo_root)
+        checks.append((CONFIG_FILE, "valid" if (repo_root / CONFIG_FILE).exists() else "not present (defaults apply)"))
+    except ValueError as exc:
+        checks.append((CONFIG_FILE, str(exc)))
+        failures.append("configuration is invalid")
+    running, pid = Watcher.is_running(Path(store.git_dir))
+    checks.append(("Watcher", f"running (pid {pid})" if running else "stopped"))
+    checks.append(("Metadata", f"{len(store.checkpoints)} checkpoint(s)"))
+    if store.lock_path.exists():
+        checks.append(("Operation lock", "present (another operation may be running)"))
+    else:
+        checks.append(("Operation lock", "clear"))
+    hook_path = Path(store.git_dir) / "hooks" / "post-checkout"
+    checks.append(("Local hook", "installed" if hook_path.exists() and HOOK_START in hook_path.read_text() else "not installed"))
+    for label, value in checks:
+        console.print(f"[bold]{label}:[/bold] {value}")
+    if failures:
+        raise click.ClickException("; ".join(failures))
+
+
+@main.command()
+def context() -> None:
+    """Print context from the most recent rollback for people or agents."""
+    store = _get_store()
+    path = Path(store.git_dir) / "rewind_latest_rollback.json"
+    if not path.exists():
+        console.print("[dim]No rollback context has been recorded.[/dim]")
+        return
+    console.print_json(json.dumps(json.loads(path.read_text())))
+
+
+@main.command()
+@click.argument("shell", type=click.Choice(["bash", "zsh", "fish"]))
+def completion(shell: str) -> None:
+    """Print a small shell-completion script for SHELL."""
+    commands = "watch guard stop status list diff jump undo checkout branch snap session tag clear prune init doctor context repair install uninstall completion"
+    if shell == "bash":
+        click.echo(f"complete -W '{commands}' rewind")
+    elif shell == "zsh":
+        click.echo(f"compdef '_values \"rewind command\" {commands.split()}' rewind")
+    else:
+        for command in commands.split():
+            click.echo(f"complete -c rewind -f -a {command}")
+
+
+@main.command()
+def repair() -> None:
+    """Rebuild checkpoint metadata from Rewind's shadow Git refs."""
+    count = _get_store().repair()
+    console.print(f"[green]Rebuilt metadata for {count} checkpoint(s).[/green]")
 
 
 @main.command()
@@ -464,16 +632,31 @@ def install(global_: bool) -> None:
         )
         hooks_dir.mkdir(parents=True, exist_ok=True)
         hook_path = hooks_dir / "post-checkout"
-        hook_path.write_text(GLOBAL_HOOK_SCRIPT)
-        hook_path.chmod(0o755)
+        _install_hook(hook_path)
         subprocess.run(["git", "config", "--global", "core.hooksPath", str(hooks_dir)])
         console.print(f"[green]Installed global hook at [bold]{hook_path}[/bold][/green]")
-        console.print("[dim]rewind will auto-start whenever you enter a git repo.[/dim]")
+        console.print("[dim]rewind will auto-start after Git checkout events.[/dim]")
     else:
         repo_root = _find_repo_root()
         hooks_dir = repo_root / ".git" / "hooks"
         hooks_dir.mkdir(exist_ok=True)
         hook_path = hooks_dir / "post-checkout"
-        hook_path.write_text(GLOBAL_HOOK_SCRIPT)
-        hook_path.chmod(0o755)
+        _install_hook(hook_path)
         console.print(f"[green]Installed hook at [bold]{hook_path}[/bold][/green]")
+
+
+@main.command()
+@click.option("--global", "global_", is_flag=True)
+def uninstall(global_: bool) -> None:
+    """Remove only Rewind's managed post-checkout hook block."""
+    if global_:
+        hooks_dir = Path(subprocess.run(
+            ["git", "config", "--global", "core.hooksPath"], capture_output=True, text=True,
+        ).stdout.strip() or Path.home() / ".git-hooks")
+        hook_path = hooks_dir / "post-checkout"
+    else:
+        hook_path = _find_repo_root() / ".git" / "hooks" / "post-checkout"
+    if _uninstall_hook(hook_path):
+        console.print(f"[green]Removed Rewind hook block from [bold]{hook_path}[/bold].[/green]")
+    else:
+        console.print("[yellow]No Rewind-managed hook block found.[/yellow]")
